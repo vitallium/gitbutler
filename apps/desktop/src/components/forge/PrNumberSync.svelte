@@ -3,6 +3,7 @@
 	import { LISTING_SERVICE } from "$lib/forge/listingService.svelte";
 	import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
 	import { inject } from "@gitbutler/core/context";
+	import { branchPrNumberUpdate } from "./prNumberSync";
 
 	type Props = {
 		projectId: string;
@@ -28,14 +29,16 @@
 
 	let hasRun = false;
 	$effect(() => {
-		if (canListReviews && listedPrNumber && !hasRun) {
+		const update = branchPrNumberUpdate({
+			projectId,
+			stackId,
+			branchName,
+			canListReviews,
+			listedReviewNumber: listedPrNumber,
+		});
+		if (update && !hasRun) {
 			hasRun = true;
-			stackService.updateBranchPrNumber({
-				projectId: projectId,
-				stackId,
-				branchName,
-				prNumber: listedPrNumber,
-			});
+			stackService.updateBranchPrNumber(update);
 		}
 	});
 </script>

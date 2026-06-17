@@ -72,8 +72,7 @@ function injectBackendEndpoints(api: BackendApi) {
 				},
 				query: (projectId) => ({ projectId, cacheConfig: REVIEWS_CACHE }),
 				transformResponse: (response: ForgeReview[]) => {
-					const prs = response.map((pr) => mapForgeReviewToPullRequest(pr));
-					return prAdapter.addMany(prAdapter.getInitialState(), prs);
+					return forgeReviewsToPullRequestState(response);
 				},
 				providesTags: [providesList(ReduxTag.PullRequests)],
 			}),
@@ -94,3 +93,15 @@ const prAdapter = createEntityAdapter<PullRequest, string>({
 });
 
 const prSelectors = { ...prAdapter.getSelectors(), selectByIds: createSelectByIds<PullRequest>() };
+
+export function forgeReviewsToPullRequestState(response: ForgeReview[]) {
+	const prs = response.map((pr) => mapForgeReviewToPullRequest(pr));
+	return prAdapter.addMany(prAdapter.getInitialState(), prs);
+}
+
+export function selectPullRequestBySourceBranch(
+	result: EntityState<PullRequest, string>,
+	branchName: string,
+) {
+	return prSelectors.selectById(result, branchName);
+}

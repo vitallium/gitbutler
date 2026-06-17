@@ -4,6 +4,7 @@
 	import { PR_SERVICE } from "$lib/forge/prService.svelte";
 	import { inject } from "@gitbutler/core/context";
 	import { reactive } from "@gitbutler/shared/reactiveUtils.svelte";
+	import { canPublishReview } from "./canPublishReview";
 	import type { Commit } from "@gitbutler/but-sdk";
 
 	type Props = {
@@ -27,7 +28,9 @@
 	const prQuery = $derived(prNumber ? prService.get(projectId, prNumber) : undefined);
 	const pr = $derived(prQuery?.response);
 
-	const canPublishPR = $derived(auth.authenticated.current && !pr);
+	const canPublishPR = $derived(
+		canPublishReview({ authenticated: auth.authenticated.current, reviewExists: !!pr }),
+	);
 
 	const ctaLabel = $derived(`Create ${reviewUnitName}…`);
 

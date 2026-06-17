@@ -212,6 +212,25 @@ mod tests {
     // `derive_forge_repo_info` never falls back to account storage.
 
     #[test]
+    fn gitlab_forge_info_uses_merge_request_labels_and_review_listing() {
+        let (unit, posthog_prefix) = label_for(&ForgeName::GitLab);
+        let capabilities = capabilities_for(&ForgeName::GitLab);
+
+        assert_eq!(unit.name, "Merge request");
+        assert_eq!(unit.abbr, "MR");
+        assert_eq!(unit.symbol, "!");
+        assert_eq!(posthog_prefix, "Gitlab MR");
+        assert!(
+            capabilities.list_service,
+            "GitLab must expose review listing for branch auto-linking"
+        );
+        assert!(
+            capabilities.pr_service,
+            "GitLab-linked branches use the existing review service UI"
+        );
+    }
+
+    #[test]
     fn azure_https_base_url_keeps_org_project_and_repo() {
         let info = forge_info("https://dev.azure.com/myorg/myproject/_git/myrepo").unwrap();
         assert_eq!(info.name, ForgeName::Azure);

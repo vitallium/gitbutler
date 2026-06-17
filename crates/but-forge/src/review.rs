@@ -1604,6 +1604,51 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_merge_request_converts_to_open_forge_review_with_exact_source_branch() {
+        let review = ForgeReview::from(gitlab_merge_request("feature/login"));
+
+        assert_eq!(
+            review.source_branch, "feature/login",
+            "GitLab source branch must be preserved for exact branch-name matching"
+        );
+        assert_eq!(review.number, 12, "GitLab MR iid is the review number");
+        assert_eq!(review.unit_symbol, "!", "GitLab MRs use the MR symbol");
+        assert!(review.is_open(), "unmerged and unclosed GitLab MR is open");
+    }
+
+    #[test]
+    fn gitlab_merge_request_conversion_does_not_normalize_source_branch() {
+        let review = ForgeReview::from(gitlab_merge_request("vitaly/feature-login"));
+
+        assert_eq!(
+            review.source_branch, "vitaly/feature-login",
+            "GitLab source branch is carried exactly so downstream matching stays exact"
+        );
+    }
+
+    fn gitlab_merge_request(source_branch: &str) -> but_gitlab::MergeRequest {
+        but_gitlab::MergeRequest {
+            web_url: "https://gitlab.com/gitbutler/gitbutler/-/merge_requests/12".to_string(),
+            iid: 12,
+            title: "Add login".to_string(),
+            description: Some("Body".to_string()),
+            author: None,
+            labels: vec![],
+            draft: false,
+            source_branch: source_branch.to_string(),
+            target_branch: "main".to_string(),
+            sha: "deadbeef".to_string(),
+            created_at: Some("2026-06-17T00:00:00Z".to_string()),
+            updated_at: Some("2026-06-17T00:00:00Z".to_string()),
+            merged_at: None,
+            closed_at: None,
+            project_id: 42,
+            assignees: vec![],
+            reviewers: vec![],
+        }
+    }
+
+    #[test]
     fn test_is_valid_review_template_path_github() {
         assert!(is_valid_review_template_path_github(p(
             ".github/PULL_REQUEST_TEMPLATE.md"
