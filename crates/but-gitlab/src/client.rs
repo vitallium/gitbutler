@@ -698,6 +698,124 @@ impl GitLabClient {
         );
         Ok(jobs)
     }
+
+    /// Fetch pipeline jobs for a specific merge request.
+    ///
+    /// Uses the GitLab merge request pipelines endpoint to get pipelines
+    /// associated with a specific merge request.
+    pub async fn list_pipeline_jobs_for_merge_request(
+        &self,
+        project_id: GitLabProjectId,
+        merge_request_iid: i64,
+    ) -> Result<Vec<GitLabPipelineJob>> {
+        let url = format!(
+            "{}/projects/{}/merge_requests/{}/pipelines",
+            self.base_url, project_id, merge_request_iid
+        );
+        
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to get pipelines for merge request !{} in project {}",
+                    merge_request_iid, project_id
+                )
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(Vec::new());
+            }
+            bail!("Failed to get pipelines for merge request: {status}");
+        }
+
+        #[derive(Deserialize)]
+        struct GitLabMergeRequestPipeline {
+            id: i64,
+            status: String,
+            web_url: Option<String>,
+        }
+
+        let pipelines: Vec<GitLabMergeRequestPipeline> = response
+            .json()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to parse pipelines for merge request !{} in project {}",
+                    merge_request_iid, project_id
+                )
+            })?;
+
+        // For merge request pipelines, we typically want the latest pipeline
+        // If there are multiple pipelines, we'll use the first one (most recent)
+        if pipelines.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pipeline = &pipelines[0];
+        let pipeline_web_url = pipeline.web_url.clone();
+        let pipeline_status = Some(pipeline.status.clone());
+
+        // Now fetch jobs for this pipeline
+        let jobs_url = format!(
+            "{}/projects/{}/pipelines/{}/jobs",
+            self.base_url, project_id, pipeline.id
+        );
+
+        let mut jobs = Vec::new();
+        let mut next_page = Some("1".to_string());
+        let mut seen_pages = HashSet::new();
+        let mut pages_iterated = 0;
+
+        while let Some(page) = next_page.take() {
+            if pages_iterated >= MAX_PIPELINE_JOB_PAGES || !seen_pages.insert(page.clone()) {
+                bail!(
+                    "Stopped listing GitLab jobs for pipeline {} after unsafe pagination state",
+                    pipeline.id
+                );
+            }
+            pages_iterated += 1;
+
+            let response = self
+                .client
+                .get(&jobs_url)
+                .query(&[("per_page", "100"), ("page", page.as_str())])
+                .send()
+                .await
+                .with_context(|| {
+                    format!("Failed to list GitLab jobs for pipeline {}", pipeline.id)
+                })?;
+
+            if !response.status().is_success() {
+                bail!("Failed to list jobs for pipeline: {}", response.status());
+            }
+
+            next_page = next_page_from_headers(response.headers());
+            let mut page_jobs: Vec<GitLabPipelineJob> = response
+                .json()
+                .await
+                .with_context(|| {
+                    format!("Failed to parse GitLab jobs for pipeline {}", pipeline.id)
+                })?;
+            if page_jobs.is_empty() {
+                break;
+            }
+            jobs.append(&mut page_jobs);
+        }
+
+        let jobs = normalize_pipeline_jobs(
+            jobs,
+            pipeline_web_url,
+            pipeline_status,
+            &self.base_url,
+            project_id,
+        );
+        Ok(jobs)
+    }
 }
 
 fn next_page_from_headers(headers: &HeaderMap) -> Option<String> {

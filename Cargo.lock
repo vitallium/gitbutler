@@ -1241,6 +1241,7 @@ dependencies = [
  "but-utils",
  "chrono",
  "git-url-parse",
+ "regex",
  "schemars 1.2.1",
  "serde",
  "serde_json",

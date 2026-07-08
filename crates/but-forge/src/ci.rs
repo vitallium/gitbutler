@@ -1,6 +1,38 @@
+use regex;
 use serde::{Deserialize, Serialize};
 
 use crate::ForgeName;
+
+/// Extract merge request ID from a GitLab reference.
+///
+/// GitLab merge request references typically follow the pattern:
+/// - refs/merge-requests/{iid}/head
+/// - merge-requests/{iid}
+///
+/// Returns None if the reference doesn't match any known merge request pattern.
+pub(crate) fn extract_merge_request_iid_from_ref(reference: &str) -> Option<i64> {
+    // Try the full ref pattern first: refs/merge-requests/{iid}/head
+    if let Some(captures) = regex::Regex::new(r"^refs/merge-requests/(\d+)/head$")
+        .ok()
+        .and_then(|re| re.captures(reference))
+    {
+        if let Some(iid_str) = captures.get(1) {
+            return iid_str.as_str().parse::<i64>().ok();
+        }
+    }
+    
+    // Try the short form: merge-requests/{iid}
+    if let Some(captures) = regex::Regex::new(r"^merge-requests/(\d+)$")
+        .ok()
+        .and_then(|re| re.captures(reference))
+    {
+        if let Some(iid_str) = captures.get(1) {
+            return iid_str.as_str().parse::<i64>().ok();
+        }
+    }
+    
+    None
+}
 
 pub fn ci_checks_for_ref_with_cache(
     preferred_forge_user: Option<crate::ForgeUser>,
@@ -127,7 +159,26 @@ fn ci_checks_for_ref(
             let pipelines = std::thread::spawn(move || -> anyhow::Result<_> {
                 let runtime = tokio::runtime::Runtime::new()
                     .map_err(|err| anyhow::anyhow!("Failed to create tokio runtime: {err}"))?;
-                runtime.block_on(gl.list_pipeline_jobs_for_ref(project_id, &reference))
+                
+                // Try to detect if this is a merge request reference
+                // GitLab merge request references typically look like: refs/merge-requests/{iid}/head
+                let maybe_mr_iid = extract_merge_request_iid_from_ref(&reference);
+                
+                let result = if let Some(mr_iid) = maybe_mr_iid {
+                    // First try the merge request specific endpoint
+                    match runtime.block_on(gl.list_pipeline_jobs_for_merge_request(project_id.clone(), mr_iid)) {
+                        Ok(pipelines) if !pipelines.is_empty() => Ok(pipelines),
+                        _ => {
+                            // Fall back to the branch-based approach if merge request endpoint fails or returns no pipelines
+                            runtime.block_on(gl.list_pipeline_jobs_for_ref(project_id, &reference))
+                        }
+                    }
+                } else {
+                    // Use the branch-based approach for non-merge-request references
+                    runtime.block_on(gl.list_pipeline_jobs_for_ref(project_id, &reference))
+                };
+                
+                result
             })
             .join()
             .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
@@ -615,6 +666,49 @@ mod tests {
         assert_ne!(
             CiCheck::from(bb_status("SUCCESSFUL")).id,
             CiCheck::from(other_key).id
+        );
+    }
+
+    #[test]
+    fn test_extract_merge_request_iid_from_ref() {
+        // Test full ref pattern
+        assert_eq!(
+            super::extract_merge_request_iid_from_ref("refs/merge-requests/123/head"),
+            Some(123)
+        );
+        assert_eq!(
+            super::extract_merge_request_iid_from_ref("refs/merge-requests/456/head"),
+            Some(456)
+        );
+
+        // Test short form
+        assert_eq!(
+            super::extract_merge_request_iid_from_ref("merge-requests/789"),
+            Some(789)
+        );
+
+        // Test non-merge-request references
+        assert_eq!(
+            super::extract_merge_request_iid_from_ref("refs/heads/main"),
+            None
+        );
+        assert_eq!(
+            super::extract_merge_request_iid_from_ref("feature-branch"),
+            None
+        );
+        assert_eq!(
+            super::extract_merge_request_iid_from_ref("refs/tags/v1.0.0"),
+            None
+        );
+
+        // Test malformed patterns
+        assert_eq!(
+            super::extract_merge_request_iid_from_ref("refs/merge-requests/abc/head"),
+            None
+        );
+        assert_eq!(
+            super::extract_merge_request_iid_from_ref("merge-requests/"),
+            None
         );
     }
 }
