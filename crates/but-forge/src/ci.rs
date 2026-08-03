@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ForgeName;
+use but_gitlab::is_pipeline_unresolvable;
 
 pub fn ci_checks_for_ref_with_cache(
     preferred_forge_user: Option<crate::ForgeUser>,
@@ -140,23 +141,23 @@ fn ci_checks_for_ref(
             let reference = reference.to_string();
             let reference_for_checks = reference.clone();
 
-            let pipelines = std::thread::spawn(move || -> anyhow::Result<_> {
+            let checks = std::thread::spawn(move || -> anyhow::Result<Option<Vec<CiCheck>>> {
                 let runtime = tokio::runtime::Runtime::new()
                     .map_err(|err| anyhow::anyhow!("Failed to create tokio runtime: {err}"))?;
-                runtime.block_on(gl.list_pipeline_jobs_for_ref(project_id, &reference))
+                runtime.block_on(gitlab_checks(&gl, project_id, &reference))
             })
             .join()
             .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
-            Ok(Some(
-                pipelines
+
+            Ok(checks.map(|checks| {
+                checks
                     .into_iter()
-                    .map(|pipeline| {
-                        let mut ci_check = CiCheck::from(pipeline);
-                        ci_check.reference = reference_for_checks.to_string();
-                        ci_check
+                    .map(|mut check| {
+                        check.reference = reference_for_checks.clone();
+                        check
                     })
-                    .collect(),
-            ))
+                    .collect()
+            }))
         }
         ForgeName::Bitbucket => {
             let preferred_account = preferred_forge_user
@@ -193,6 +194,120 @@ fn ci_checks_for_ref(
         _ => Err(anyhow::anyhow!(
             "Listing ci checks for forge {forge:?} is not implemented yet."
         )),
+    }
+}
+
+/// Resolve a GitLab branch's checks from the pipeline GitLab itself considers
+/// current for a branch.
+///
+/// Returns `Ok(None)` when the pipeline lookup fails with 403/404 (preserves cache),
+/// `Ok(Some(vec![]))` when no pipeline exists (clears cache), or the checks.
+async fn gitlab_checks(
+    gl: &but_gitlab::GitLabClient,
+    project_id: but_gitlab::GitLabProjectId,
+    branch: &str,
+) -> anyhow::Result<Option<Vec<CiCheck>>> {
+    let pipeline = match gl
+        .latest_pipeline_for_branch(project_id.clone(), branch)
+        .await
+    {
+        Ok(Some(p)) => p,
+        Ok(None) => return Ok(Some(Vec::new())),
+        Err(err) => {
+            // 403/404 means we can't determine if there's a pipeline.
+            // Preserve the cache by returning None.
+            if is_pipeline_unresolvable(&err) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+    };
+
+    let failed_jobs = if matches!(
+        pipeline.status.as_str(),
+        "failed" | "running" | "canceling" | "canceled"
+    ) {
+        gl.failed_jobs(project_id, pipeline.id).await?
+    } else {
+        Vec::new()
+    };
+
+    let mut checks = vec![CiCheck::from(&pipeline)];
+    checks.extend(
+        failed_jobs
+            .into_iter()
+            .map(|job| gitlab_job_check(job, &pipeline)),
+    );
+    defer_pipeline_check_to_named_jobs(&mut checks);
+    Ok(Some(checks))
+}
+
+/// Let named jobs own the failure the pipeline-level check reports.
+fn defer_pipeline_check_to_named_jobs(checks: &mut [CiCheck]) {
+    let Some((pipeline_check, job_checks)) = checks.split_first_mut() else {
+        return;
+    };
+    let named = job_checks.iter().any(|check| {
+        matches!(
+            check.status,
+            CiStatus::Complete {
+                conclusion: CiConclusion::Failure,
+                ..
+            }
+        )
+    });
+    if !named {
+        return;
+    }
+    if let CiStatus::Complete {
+        conclusion: conclusion @ CiConclusion::Failure,
+        ..
+    } = &mut pipeline_check.status
+    {
+        *conclusion = CiConclusion::Neutral;
+    }
+}
+
+fn parse_gitlab_timestamp(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    value
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn gitlab_job_check(
+    job: but_gitlab::GitLabPipelineJob,
+    pipeline: &but_gitlab::GitLabPipeline,
+) -> CiCheck {
+    let completed_at = parse_gitlab_timestamp(job.finished_at.as_deref());
+    // Only failed jobs are fetched. An allowed failure is neutral: GitLab does
+    // not let it fail the pipeline, so it must not fail the badge either.
+    let conclusion = if job.allow_failure {
+        CiConclusion::Neutral
+    } else {
+        CiConclusion::Failure
+    };
+
+    let url = job
+        .web_url
+        .or_else(|| pipeline.web_url.clone())
+        .unwrap_or_default();
+
+    CiCheck {
+        id: job.id,
+        name: job.name,
+        output: CiOutput::default(),
+        started_at: parse_gitlab_timestamp(job.started_at.as_deref()),
+        status: CiStatus::Complete {
+            conclusion,
+            completed_at,
+        },
+        head_sha: pipeline.sha.clone(),
+        url: url.clone(),
+        html_url: url.clone(),
+        details_url: url,
+        pull_requests: Vec::new(),
+        reference: String::new(), // Will be set by the caller
+        last_sync_at: chrono::Local::now().naive_local(),
     }
 }
 
@@ -287,31 +402,17 @@ pub struct PullRequestMinimal {
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(PullRequestMinimal);
 
-impl From<but_gitlab::GitLabPipelineJob> for CiCheck {
-    fn from(job: but_gitlab::GitLabPipelineJob) -> Self {
-        let started_at = job
-            .started_at
-            .as_deref()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        let completed_at = job
-            .finished_at
-            .as_deref()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        let status = match job.status.as_str() {
+/// The pipeline-level check that carries a GitLab branch's aggregate CI state.
+impl From<&but_gitlab::GitLabPipeline> for CiCheck {
+    fn from(pipeline: &but_gitlab::GitLabPipeline) -> Self {
+        let completed_at = parse_gitlab_timestamp(pipeline.updated_at.as_deref());
+        let status = match pipeline.status.as_str() {
             "success" => CiStatus::Complete {
                 conclusion: CiConclusion::Success,
                 completed_at,
             },
             "failed" => CiStatus::Complete {
-                conclusion: if job.allow_failure {
-                    CiConclusion::Neutral
-                } else {
-                    CiConclusion::Failure
-                },
+                conclusion: CiConclusion::Failure,
                 completed_at,
             },
             "canceled" => CiStatus::Complete {
@@ -322,43 +423,38 @@ impl From<but_gitlab::GitLabPipelineJob> for CiCheck {
                 conclusion: CiConclusion::Skipped,
                 completed_at,
             },
+            // A pipeline is only `manual` when it is genuinely blocked on one.
+            // Individual manual jobs do not put the pipeline in this state, so
+            // a routine manual deploy job no longer pins the badge to "action
+            // required".
             "manual" => CiStatus::Complete {
-                conclusion: if job.allow_failure {
-                    CiConclusion::Neutral
-                } else {
-                    CiConclusion::ActionRequired
-                },
+                conclusion: CiConclusion::ActionRequired,
                 completed_at,
             },
             "running" | "canceling" => CiStatus::InProgress,
-            "pending"
-            | "created"
-            | "waiting_for_resource"
-            | "waiting_for_callback"
+            "created"
+            | "pending"
             | "preparing"
-            | "scheduled" => CiStatus::Queued,
+            | "scheduled"
+            | "waiting_for_resource"
+            | "waiting_for_callback" => CiStatus::Queued,
             _ => CiStatus::Unknown,
         };
 
-        let job_url = job.web_url.clone().unwrap_or_default();
-        let pipeline_url = job
-            .pipeline
-            .web_url
-            .clone()
-            .unwrap_or_else(|| job_url.clone());
+        let url = pipeline.web_url.clone().unwrap_or_default();
 
         CiCheck {
-            id: job.id,
-            name: job.name,
+            id: pipeline.id,
+            name: format!("Pipeline #{}", pipeline.id),
             output: CiOutput::default(),
-            started_at,
+            started_at: parse_gitlab_timestamp(pipeline.created_at.as_deref()),
             status,
-            head_sha: String::new(),
-            url: job_url.clone(),
-            html_url: job_url.clone(),
-            details_url: pipeline_url,
+            head_sha: pipeline.sha.clone(),
+            url: url.clone(),
+            html_url: url.clone(),
+            details_url: url,
             pull_requests: Vec::new(),
-            reference: String::new(),
+            reference: String::new(), // Will be set by the caller
             last_sync_at: chrono::Local::now().naive_local(),
         }
     }
@@ -563,80 +659,113 @@ mod tests {
         );
     }
 
-    fn job(status: &str, web_url: Option<&str>) -> but_gitlab::GitLabPipelineJob {
+    fn pipeline(status: &str) -> but_gitlab::GitLabPipeline {
+        but_gitlab::GitLabPipeline {
+            id: 7,
+            sha: "deadbeef".into(),
+            status: status.into(),
+            created_at: Some("2026-05-01T12:00:00Z".into()),
+            updated_at: Some("2026-05-01T12:05:00Z".into()),
+            web_url: Some("https://gitlab.example/-/pipelines/7".into()),
+        }
+    }
+
+    fn job(allow_failure: bool) -> but_gitlab::GitLabPipelineJob {
         but_gitlab::GitLabPipelineJob {
             id: 42,
-            name: "job".into(),
-            status: status.into(),
-            allow_failure: false,
+            name: "rspec".into(),
+            status: "failed".into(),
+            allow_failure,
             started_at: Some("2026-05-01T12:00:00Z".into()),
             finished_at: Some("2026-05-01T12:05:00Z".into()),
-            web_url: web_url.map(str::to_owned),
-            pipeline: but_gitlab::GitLabPipelineRef {
-                id: 7,
-                web_url: None,
-                status: None,
-            },
+            web_url: None,
         }
     }
 
     #[test]
-    fn maps_manual_jobs_to_action_required_complete_status() {
-        let check = CiCheck::from(job("manual", Some("https://example.com/job")));
+    fn maps_every_gitlab_pipeline_status() {
+        let conclusion_of = |status: &str| match CiCheck::from(&pipeline(status)).status {
+            CiStatus::Complete { conclusion, .. } => format!("{conclusion:?}"),
+            other => format!("{other:?}"),
+        };
 
-        assert!(matches!(
-            check.status,
-            CiStatus::Complete {
-                conclusion: CiConclusion::ActionRequired,
-                ..
-            }
-        ));
+        // GitLab already discounts allowed failures before reporting `failed`,
+        // and only reports `manual` when the pipeline is genuinely blocked.
+        assert_eq!(
+            conclusion_of("success"),
+            "Success",
+            "a green pipeline passes"
+        );
+        assert_eq!(conclusion_of("failed"), "Failure", "a red pipeline fails");
+        assert_eq!(
+            conclusion_of("canceled"),
+            "Cancelled",
+            "a cancelled pipeline is finished, not failed"
+        );
+        assert_eq!(
+            conclusion_of("skipped"),
+            "Skipped",
+            "a skipped pipeline ran nothing to judge"
+        );
+        assert_eq!(
+            conclusion_of("manual"),
+            "ActionRequired",
+            "only a blocked pipeline is manual"
+        );
+        for running in ["running", "canceling"] {
+            assert_eq!(
+                conclusion_of(running),
+                "InProgress",
+                "{running} has not settled"
+            );
+        }
+        for queued in [
+            "created",
+            "pending",
+            "preparing",
+            "scheduled",
+            "waiting_for_resource",
+            "waiting_for_callback",
+        ] {
+            assert_eq!(conclusion_of(queued), "Queued", "{queued} has not started");
+        }
+        assert_eq!(
+            conclusion_of("something-new"),
+            "Unknown",
+            "an unrecognised status must not be guessed into a verdict"
+        );
     }
 
     #[test]
-    fn maps_allowed_failure_jobs_to_neutral_complete_status() {
-        let mut job = job("failed", Some("https://example.com/job"));
-        job.allow_failure = true;
+    fn pipeline_check_carries_the_commit_it_ran_against() {
+        let check = CiCheck::from(&pipeline("success"));
 
-        let check = CiCheck::from(job);
-
-        assert!(matches!(
-            check.status,
-            CiStatus::Complete {
-                conclusion: CiConclusion::Neutral,
-                ..
-            }
-        ));
+        assert_eq!(
+            check.head_sha, "deadbeef",
+            "the commit distinguishes a stale pipeline from the current one"
+        );
+        assert_eq!(
+            check.details_url, "https://gitlab.example/-/pipelines/7",
+            "clicking the badge opens the pipeline"
+        );
     }
 
     #[test]
-    fn maps_optional_manual_jobs_to_neutral_complete_status() {
-        let mut job = job("manual", Some("https://example.com/job"));
-        job.allow_failure = true;
-
-        let check = CiCheck::from(job);
-
-        assert!(matches!(
-            check.status,
-            CiStatus::Complete {
-                conclusion: CiConclusion::Neutral,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn maps_canceling_jobs_to_in_progress_status() {
-        let check = CiCheck::from(job("canceling", Some("https://example.com/job")));
-
-        assert!(matches!(check.status, CiStatus::InProgress));
-    }
-
-    #[test]
-    fn maps_waiting_for_callback_jobs_to_queued_status() {
-        let check = CiCheck::from(job("waiting_for_callback", Some("https://example.com/job")));
-
-        assert!(matches!(check.status, CiStatus::Queued));
+    fn only_fetches_jobs_for_pipelines_that_can_have_failures() {
+        // A running pipeline is included so an early failure surfaces before
+        // the pipeline settles.
+        for status in ["failed", "running", "canceling", "canceled"] {
+            assert!(
+                matches!(status, "failed" | "running" | "canceling" | "canceled"),
+                "{status} can hold a failed job worth naming"
+            );
+        }
+        for status in ["success", "skipped", "created", "pending", "manual"] {
+            assert!(
+                !matches!(status, "failed" | "running" | "canceling" | "canceled"),
+                "{status} would spend a request on nothing"
+            );
+        }
     }
 
     fn bb_status(state: &str) -> but_bitbucket::BitbucketBuildStatus {

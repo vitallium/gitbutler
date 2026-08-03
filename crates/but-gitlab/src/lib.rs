@@ -5,12 +5,24 @@ mod client;
 pub mod mr;
 mod project;
 pub use client::{
-    CreateMergeRequestParams, GitLabClient, GitLabLabel, GitLabPipelineJob, GitLabPipelineRef,
-    GitLabProject, GitLabUser, MergeMergeRequestParams, MergeRequest, MergeRequestMergeStatus,
-    SetMergeRequestAutoMergeParams, SetMergeRequestDraftStateParams, UpdateMergeRequestParams,
+    CreateMergeRequestParams, GitLabClient, GitLabLabel, GitLabPipeline, GitLabPipelineJob,
+    GitLabProject, GitLabUser, HttpStatusError, MergeMergeRequestParams, MergeRequest,
+    MergeRequestMergeStatus, SetMergeRequestAutoMergeParams, SetMergeRequestDraftStateParams,
+    UpdateMergeRequestParams,
 };
 pub use project::{GitLabProjectId, fetch_project};
 mod token;
+
+/// Check if an error is a 403 Forbidden or 404 Not Found from GitLab API.
+/// These indicate the resource couldn't be resolved, not a permission issue,
+/// so the caller should preserve cached data rather than treating it as an error.
+pub fn is_pipeline_unresolvable(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<HttpStatusError>()
+        .is_some_and(|http_err| {
+            http_err.status == reqwest::StatusCode::FORBIDDEN
+                || http_err.status == reqwest::StatusCode::NOT_FOUND
+        })
+}
 use serde::Serialize;
 pub use token::GitlabAccountIdentifier;
 
