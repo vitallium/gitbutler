@@ -184,7 +184,7 @@ fn list_open_mrs_includes_a_page_two_match_without_duplicates() {
         assert_requests(
             &requests,
             "/api/v4/projects/group%2Frepo/merge_requests",
-            &[("state", "opened"), ("order_by", "created_at")],
+            &[("state", "opened")],
             &["1", "2"],
         );
     });
@@ -293,7 +293,7 @@ fn list_open_mrs_keeps_a_paginated_mr_with_null_sha() {
         assert_requests(
             &server.finish(),
             "/api/v4/projects/group%2Frepo/merge_requests",
-            &[("state", "opened"), ("order_by", "created_at")],
+            &[("state", "opened")],
             &["1", "2"],
         );
     });
@@ -315,7 +315,7 @@ fn list_open_mrs_stops_after_a_normal_first_page() {
         assert_requests(
             &server.finish(),
             "/api/v4/projects/group%2Frepo/merge_requests",
-            &[("state", "opened"), ("order_by", "created_at")],
+            &[("state", "opened")],
             &["1"],
         );
     });
@@ -347,7 +347,7 @@ fn list_open_mrs_stops_on_an_empty_page() {
         assert_requests(
             &server.finish(),
             "/api/v4/projects/group%2Frepo/merge_requests",
-            &[("state", "opened"), ("order_by", "created_at")],
+            &[("state", "opened")],
             &["1", "2"],
         );
     });
@@ -378,7 +378,7 @@ fn list_open_mrs_rejects_a_repeated_page() {
         assert_requests(
             &server.finish(),
             "/api/v4/projects/group%2Frepo/merge_requests",
-            &[("state", "opened"), ("order_by", "created_at")],
+            &[("state", "opened")],
             &["1", "2"],
         );
     });

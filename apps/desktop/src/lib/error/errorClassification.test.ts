@@ -107,6 +107,17 @@ describe("classify", () => {
 			expect(result.userMessage).toContain("expired");
 			expect(result.userMessage).toContain("log out");
 		});
+
+		test("GitLabTokenExpired tells the user to log out and back in", () => {
+			const error = new IpcError(
+				{ message: "token rejected", code: "GitLabTokenExpired" },
+				"list_reviews",
+			);
+			const result = classify(error);
+			expect(result.severity).toBe("error");
+			expect(result.userMessage).toContain("GitLab");
+			expect(result.userMessage).toContain("log out");
+		});
 	});
 
 	describe("default severity", () => {

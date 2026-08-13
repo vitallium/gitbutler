@@ -13,6 +13,7 @@ const GITLAB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 // self-hosted projects while bounding runaway pagination.
 const MAX_MERGE_REQUEST_REQUESTS: usize = 10_000;
 const MAX_PIPELINE_JOB_PAGES: usize = 25;
+const MAX_OPEN_MR_PAGES: usize = 25;
 
 /// An HTTP error with a status code, returned when the API responds with a non-success status.
 ///
@@ -142,12 +143,81 @@ impl GitLabClient {
 
     pub async fn list_open_mrs(&self, project_id: GitLabProjectId) -> Result<Vec<MergeRequest>> {
         let url = format!("{}/projects/{}/merge_requests", self.base_url, project_id);
-        self.list_merge_requests(
-            &url,
-            &[("state", "opened"), ("order_by", "created_at")],
-            "Failed to list open merge requests",
-        )
-        .await
+        let mut mrs = Vec::new();
+        let mut next_page = Some("1".to_string());
+        let mut seen_pages = HashSet::new();
+        let mut pages_iterated = 0;
+
+        while let Some(page) = next_page.take() {
+            if pages_iterated >= MAX_OPEN_MR_PAGES || !seen_pages.insert(page.clone()) {
+                bail!("Stopped listing GitLab merge requests after unsafe pagination state");
+            }
+            pages_iterated += 1;
+
+            let response = self
+                .client
+                .get(&url)
+                .query(&[
+                    ("state", "opened"),
+                    ("per_page", "100"),
+                    ("page", page.as_str()),
+                ])
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                return Err(HttpStatusError {
+                    status: response.status(),
+                }
+                .into());
+            }
+
+            next_page = next_page_from_headers(response.headers());
+            let page_mrs: Vec<GitLabMergeRequest> = response.json().await?;
+            if page_mrs.is_empty() {
+                break;
+            }
+            mrs.extend(page_mrs);
+        }
+
+        let mut seen = HashSet::new();
+        Ok(mrs
+            .into_iter()
+            .filter(|mr| seen.insert(mr.iid))
+            .map(Into::into)
+            .collect())
+    }
+
+    /// List open merge requests whose GitLab `source_branch` equals `source_branch`.
+    ///
+    /// Auto-detect uses this instead of [`Self::list_open_mrs`] so a project with
+    /// thousands of open MRs is one request per local head, not a full crawl.
+    pub async fn list_open_mrs_for_source_branch(
+        &self,
+        project_id: GitLabProjectId,
+        source_branch: &str,
+    ) -> Result<Vec<MergeRequest>> {
+        let url = format!("{}/projects/{}/merge_requests", self.base_url, project_id);
+        let response = self
+            .client
+            .get(&url)
+            .query(&[
+                ("state", "opened"),
+                ("source_branch", source_branch),
+                ("per_page", "100"),
+            ])
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(HttpStatusError {
+                status: response.status(),
+            }
+            .into());
+        }
+
+        let mrs: Vec<GitLabMergeRequest> = response.json().await?;
+        Ok(mrs.into_iter().map(Into::into).collect())
     }
 
     pub async fn list_mrs_for_target(
@@ -1153,6 +1223,9 @@ pub(crate) fn resolve_account(
 
     Ok(account.to_owned())
 }
+
+#[cfg(test)]
+mod list_open_mrs_tests;
 
 #[cfg(test)]
 mod tests {

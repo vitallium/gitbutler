@@ -281,14 +281,19 @@ pub fn list_reviews(
     ctx: &Context,
     cache_config: Option<but_forge::CacheConfig>,
 ) -> Result<Vec<but_forge::ForgeReview>> {
-    let (storage, forge_repo_info, preferred_forge_user) = {
+    let (storage, forge_repo_info, preferred_forge_user, source_branches) = {
         let project_meta = ctx.project_meta()?;
         let repo = ctx.repo.get()?;
         let forge_repo_info = but_forge::derive_forge_repo_info(&remote_url(&project_meta, &repo)?);
+        let source_branches = match forge_repo_info.as_ref().map(|info| &info.forge) {
+            Some(ForgeName::GitLab) => Some(review_source_branch_names(&repo)?),
+            _ => None,
+        };
         (
             but_forge_storage::Controller::from_path(but_path::app_data_dir()?),
             forge_repo_info,
             ctx.legacy_project.preferred_forge_user.clone(),
+            source_branches,
         )
     };
 
@@ -300,7 +305,39 @@ pub fn list_reviews(
         &storage,
         db,
         cache_config,
+        source_branches.as_deref(),
     )
+}
+
+/// Local and remote-tracking short names used as GitLab `source_branch` filters.
+///
+/// Association matches a pushed short name, so remotes are included. Local
+/// heads cover a branch that exists here but whose remote-tracking ref is gone.
+fn review_source_branch_names(repo: &gix::Repository) -> Result<Vec<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for reference in repo
+        .references()?
+        .prefixed("refs/heads/")?
+        .filter_map(Result::ok)
+    {
+        if let Ok(name) = reference.name().shorten().to_str() {
+            names.insert(name.to_owned());
+        }
+    }
+    let remote_names = repo.remote_names();
+    for reference in repo
+        .references()?
+        .prefixed("refs/remotes/")?
+        .filter_map(Result::ok)
+    {
+        if let Some((_, short)) =
+            but_core::extract_remote_name_and_short_name(reference.name(), &remote_names)
+            && let Ok(name) = short.to_str()
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    Ok(names.into_iter().collect())
 }
 
 /// Applies a forge review by resolving it to its source branch.

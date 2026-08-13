@@ -519,6 +519,7 @@ pub fn list_forge_reviews_with_cache(
     storage: &but_forge_storage::Controller,
     db: &mut but_db::DbHandle,
     cache_config: Option<CacheConfig>,
+    source_branches: Option<&[String]>,
 ) -> Result<Vec<ForgeReview>> {
     let cache_config = cache_config.unwrap_or_default();
     let reviews = match cache_config {
@@ -535,7 +536,13 @@ pub fn list_forge_reviews_with_cache(
             {
                 return Ok(reviews.into_iter().filter(ForgeReview::is_open).collect());
             }
-            match sync_listed_reviews(preferred_forge_user, forge_repo_info, storage, db) {
+            match sync_listed_reviews(
+                preferred_forge_user,
+                forge_repo_info,
+                storage,
+                db,
+                source_branches,
+            ) {
                 Ok(reviews) => reviews,
                 Err(err) => {
                     let cached_open: Vec<ForgeReview> = crate::list_cached_forge_reviews(db)?
@@ -550,9 +557,13 @@ pub fn list_forge_reviews_with_cache(
                 }
             }
         }
-        CacheConfig::NoCache => {
-            sync_listed_reviews(preferred_forge_user, forge_repo_info, storage, db)?
-        }
+        CacheConfig::NoCache => sync_listed_reviews(
+            preferred_forge_user,
+            forge_repo_info,
+            storage,
+            db,
+            source_branches,
+        )?,
     };
     Ok(reviews)
 }
@@ -595,8 +606,14 @@ fn sync_listed_reviews(
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
     db: &mut but_db::DbHandle,
+    source_branches: Option<&[String]>,
 ) -> Result<Vec<ForgeReview>> {
-    let reviews = list_forge_reviews(&preferred_forge_user, forge_repo_info, storage)?;
+    let reviews = list_forge_reviews(
+        &preferred_forge_user,
+        forge_repo_info,
+        storage,
+        source_branches,
+    )?;
     let cached_states = crate::db::cached_review_states(db).unwrap_or_default();
     let mut to_cache = reviews.clone();
     if open_review_vanished(&cached_states, &reviews) {
@@ -874,6 +891,7 @@ fn list_forge_reviews(
     preferred_forge_user: &Option<crate::ForgeUser>,
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
+    source_branches: Option<&[String]>,
 ) -> Result<Vec<ForgeReview>> {
     let crate::forge::ForgeRepoInfo {
         forge, owner, repo, ..
@@ -915,6 +933,7 @@ fn list_forge_reviews(
             // Clone owned data for thread
             let project_id = GitLabProjectId::new(owner, repo);
             let storage = storage.clone();
+            let source_branches = source_branches.map(|b| b.to_vec());
 
             let mrs = std::thread::spawn(move || {
                 tokio::runtime::Runtime::new()
@@ -923,6 +942,7 @@ fn list_forge_reviews(
                         preferred_account.as_ref(),
                         project_id,
                         &storage,
+                        source_branches.as_deref(),
                     ))
             })
             .join()
@@ -3485,6 +3505,7 @@ mod tests {
             Some(CacheConfig::CacheWithFallback {
                 max_age_seconds: 300,
             }),
+            None,
         )
         .unwrap();
 

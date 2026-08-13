@@ -6,12 +6,28 @@ pub async fn list(
     preferred_account: Option<&crate::GitlabAccountIdentifier>,
     project_id: GitLabProjectId,
     storage: &but_forge_storage::Controller,
+    source_branches: Option<&[String]>,
 ) -> Result<Vec<crate::client::MergeRequest>> {
-    GitLabClient::from_storage(storage, preferred_account)?
-        .list_open_mrs(project_id)
-        .await
-        .map_err(classify_forge_error)
-        .context("Failed to list open merge requests")
+    let client = GitLabClient::from_storage(storage, preferred_account)?;
+    match source_branches {
+        Some(branches) if !branches.is_empty() => {
+            let mut all_mrs = Vec::new();
+            for source_branch in branches {
+                let mrs = client
+                    .list_open_mrs_for_source_branch(project_id.clone(), source_branch)
+                    .await
+                    .map_err(classify_forge_error)
+                    .context("Failed to list open merge requests for source branch")?;
+                all_mrs.extend(mrs);
+            }
+            Ok(all_mrs)
+        }
+        _ => client
+            .list_open_mrs(project_id)
+            .await
+            .map_err(classify_forge_error)
+            .context("Failed to list open merge requests"),
+    }
 }
 
 pub async fn list_recently_closed(
