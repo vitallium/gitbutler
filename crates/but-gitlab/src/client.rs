@@ -603,9 +603,9 @@ impl GitLabClient {
         Ok(mr)
     }
 
-    /// Fetch pipeline jobs for the latest commit on a given branch reference.
+    /// Fetch pipeline jobs for the newest pipeline on a given branch reference.
     ///
-    /// Returns an empty vec if GitLab has no pipeline for the latest commit on the ref.
+    /// Returns an empty vec if GitLab has no pipeline for the ref.
     pub async fn list_pipeline_jobs_for_ref(
         &self,
         project_id: GitLabProjectId,
@@ -618,30 +618,34 @@ impl GitLabClient {
             web_url: Option<String>,
         }
 
-        let url = format!("{}/projects/{}/pipelines/latest", self.base_url, project_id);
+        let url = format!("{}/projects/{}/pipelines", self.base_url, project_id);
         let response = self
             .client
             .get(&url)
-            .query(&[("ref", reference)])
+            .query(&[
+                ("ref", reference),
+                ("order_by", "id"),
+                ("sort", "desc"),
+                ("per_page", "1"),
+            ])
             .send()
             .await
-            .with_context(|| {
-                format!("Failed to get latest GitLab pipeline for ref '{reference}'")
-            })?;
+            .with_context(|| format!("Failed to list GitLab pipelines for ref '{reference}'"))?;
 
         if !response.status().is_success() {
             let status = response.status();
-            if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND
-            {
-                return Ok(Vec::new());
-            }
-            bail!("Failed to get latest pipeline for ref: {status}");
+            bail!("Failed to list pipelines for ref: {status}");
         }
 
-        let pipeline: GitLabPipelineResponse = response
-            .json()
+        let pipeline = response
+            .json::<Vec<GitLabPipelineResponse>>()
             .await
-            .with_context(|| format!("Failed to parse GitLab pipeline for ref '{reference}'"))?;
+            .with_context(|| format!("Failed to parse GitLab pipelines for ref '{reference}'"))?
+            .into_iter()
+            .next();
+        let Some(pipeline) = pipeline else {
+            return Ok(Vec::new());
+        };
 
         let pipeline_web_url = pipeline.web_url;
         let pipeline_status = Some(pipeline.status);
