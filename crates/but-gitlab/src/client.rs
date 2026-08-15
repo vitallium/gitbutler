@@ -1079,11 +1079,188 @@ pub(crate) fn resolve_account(
 #[cfg(test)]
 mod tests {
     use super::{
-        GitLabMergeRequest, GitLabPipelineJob, GitLabPipelineRef, MergeRequest,
+        GitLabClient, GitLabMergeRequest, GitLabPipelineJob, GitLabPipelineRef, MergeRequest,
         next_page_from_headers, normalize_pipeline_jobs, repo_owner_from_path_with_namespace,
         update_draft_state_in_title,
     };
+    use but_secret::Sensitive;
     use reqwest::header::{HeaderMap, HeaderValue};
+    use std::{
+        io::{ErrorKind, Read as _, Write as _},
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
+
+    struct MockResponse {
+        path: &'static str,
+        status: reqwest::StatusCode,
+        headers: &'static [(&'static str, &'static str)],
+        body: &'static str,
+    }
+
+    fn mock_client(responses: Vec<MockResponse>) -> (GitLabClient, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for expected in responses {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(err)
+                            if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(err) => panic!("expected request to {}: {err}", expected.path),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert_ne!(read, 0, "request should include complete HTTP headers");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let mut request_line = request.lines().next().unwrap().split_whitespace();
+                assert_eq!(request_line.next(), Some("GET"));
+                assert_eq!(request_line.next(), Some(expected.path));
+
+                let reason = expected.status.canonical_reason().unwrap_or("Unknown");
+                let headers = expected
+                    .headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect::<String>();
+                write!(
+                    stream,
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+                    expected.status.as_u16(),
+                    reason,
+                    expected.body.len(),
+                    headers,
+                    expected.body
+                )
+                .unwrap();
+            }
+        });
+        let mut client =
+            GitLabClient::new(&Sensitive("test-token".to_string())).expect("valid test token");
+        client.base_url = format!("http://{addr}/api/v4");
+        (client, server)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lists_jobs_for_the_newest_pipeline_on_a_ref() {
+        let (client, server) = mock_client(vec![
+            MockResponse {
+                path: "/api/v4/projects/group%2Frepo/pipelines?ref=feature%2Flogin&order_by=id&sort=desc&per_page=1",
+                status: reqwest::StatusCode::OK,
+                headers: &[],
+                body: r#"[{"id":123,"status":"running","web_url":"https://gitlab.example/group/repo/-/pipelines/123"}]"#,
+            },
+            MockResponse {
+                path: "/api/v4/projects/group%2Frepo/pipelines/123/jobs?per_page=100&page=1",
+                status: reqwest::StatusCode::OK,
+                headers: &[],
+                body: r#"[{"id":1,"name":"test","status":"running","started_at":null,"finished_at":null,"web_url":null,"pipeline":{"id":123,"web_url":null,"status":null}}]"#,
+            },
+        ]);
+
+        let jobs = client
+            .list_pipeline_jobs_for_ref(
+                crate::GitLabProjectId::new("group", "repo"),
+                "feature/login",
+            )
+            .await
+            .expect("the newest pipeline should resolve its jobs");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, 1);
+        assert_eq!(
+            jobs[0].web_url.as_deref(),
+            Some("https://gitlab.example/group/repo/-/pipelines/123")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_pipeline_list_returns_no_jobs() {
+        let (client, server) = mock_client(vec![MockResponse {
+            path: "/api/v4/projects/group%2Frepo/pipelines?ref=feature&order_by=id&sort=desc&per_page=1",
+            status: reqwest::StatusCode::OK,
+            headers: &[],
+            body: "[]",
+        }]);
+
+        let jobs = client
+            .list_pipeline_jobs_for_ref(crate::GitLabProjectId::new("group", "repo"), "feature")
+            .await
+            .expect("an empty pipeline list is authoritative");
+
+        assert!(jobs.is_empty());
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipeline_list_errors_are_not_reported_as_no_jobs() {
+        let (client, server) = mock_client(vec![MockResponse {
+            path: "/api/v4/projects/group%2Frepo/pipelines?ref=feature&order_by=id&sort=desc&per_page=1",
+            status: reqwest::StatusCode::FORBIDDEN,
+            headers: &[],
+            body: "{}",
+        }]);
+
+        let err = client
+            .list_pipeline_jobs_for_ref(crate::GitLabProjectId::new("group", "repo"), "feature")
+            .await
+            .expect_err("forbidden pipeline access must remain an error");
+
+        assert!(
+            err.to_string().contains("403 Forbidden"),
+            "the HTTP status should be actionable: {err:#}"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lists_all_pages_of_pipeline_jobs() {
+        let (client, server) = mock_client(vec![
+            MockResponse {
+                path: "/api/v4/projects/group%2Frepo/pipelines?ref=feature&order_by=id&sort=desc&per_page=1",
+                status: reqwest::StatusCode::OK,
+                headers: &[],
+                body: r#"[{"id":123,"status":"running","web_url":null}]"#,
+            },
+            MockResponse {
+                path: "/api/v4/projects/group%2Frepo/pipelines/123/jobs?per_page=100&page=1",
+                status: reqwest::StatusCode::OK,
+                headers: &[("X-Next-Page", "2")],
+                body: r#"[{"id":1,"name":"first","status":"success","started_at":null,"finished_at":null,"web_url":null,"pipeline":{"id":123,"web_url":null,"status":null}}]"#,
+            },
+            MockResponse {
+                path: "/api/v4/projects/group%2Frepo/pipelines/123/jobs?per_page=100&page=2",
+                status: reqwest::StatusCode::OK,
+                headers: &[],
+                body: r#"[{"id":2,"name":"second","status":"success","started_at":null,"finished_at":null,"web_url":null,"pipeline":{"id":123,"web_url":null,"status":null}}]"#,
+            },
+        ]);
+
+        let jobs = client
+            .list_pipeline_jobs_for_ref(crate::GitLabProjectId::new("group", "repo"), "feature")
+            .await
+            .expect("all pipeline job pages should be collected");
+
+        assert_eq!(
+            jobs.into_iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        server.join().unwrap();
+    }
 
     fn job(
         id: i64,

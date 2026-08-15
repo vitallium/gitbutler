@@ -1360,6 +1360,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "urlencoding",
 ]
